@@ -1,9 +1,5 @@
 # Trabalho TCP - Cliente/Servidor Multithread com Chat e Transferência de Arquivos
 
-## Autor
-Daniel Zaki Sommer  
-Disciplina: Redes de Computadores
-
 ---
 
 ## Descrição do Projeto
