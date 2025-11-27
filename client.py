@@ -2,9 +2,13 @@ import socket
 import threading
 import os
 import sys
+import queue
+import struct
+import hashlib
 from protocol import (
     MSG_QUIT, MSG_FILE, MSG_CHAT,
-    send_message, receive_message, receive_file
+    MSG_FILE_OK, MSG_FILE_ERROR, MSG_FILE_META, MSG_FILE_DATA, MSG_FILE_HASH,
+    send_message, receive_message, CHUNK_SIZE
 )
 
 DOWNLOAD_DIR = 'client_downloads'
@@ -18,6 +22,8 @@ class ChatClient:
         self.socket = None
         self.connected = False
         self.running = True
+        self.file_message_queue = queue.Queue()
+        self.waiting_for_file = False
         
     def connect(self):
         try:
@@ -62,13 +68,78 @@ class ChatClient:
     def request_file(self, filename):
         try:
             print(f"\nSolicitando arquivo: {filename}")
+            
+            self.waiting_for_file = True
+            while not self.file_message_queue.empty():
+                self.file_message_queue.get()
+            
             send_message(self.socket, MSG_FILE, filename)
             
-            success, message = receive_file(self.socket, DOWNLOAD_DIR)
+            success, message = self.receive_file_from_queue()
             print(message)
             
         except Exception as e:
             print(f"Erro ao solicitar arquivo: {e}")
+        finally:
+            self.waiting_for_file = False
+    
+    def receive_file_from_queue(self):
+        try:
+            msg_type, payload = self.file_message_queue.get(timeout=10)
+            
+            if msg_type == MSG_FILE_ERROR:
+                error_msg = payload.decode('utf-8')
+                return False, f"Erro: {error_msg}"
+            
+            if msg_type != MSG_FILE_OK:
+                return False, "Resposta inválida do servidor"
+            
+            msg_type, metadata = self.file_message_queue.get(timeout=10)
+            if msg_type != MSG_FILE_META:
+                return False, "Metadados não recebidos"
+            
+            filename_size = struct.unpack('!I', metadata[:4])[0]
+            filename = metadata[4:4+filename_size].decode('utf-8')
+            file_size = struct.unpack('!Q', metadata[4+filename_size:])[0]
+            
+            print(f"Recebendo arquivo: {filename} ({file_size} bytes)")
+            
+            msg_type, file_hash_received = self.file_message_queue.get(timeout=10)
+            if msg_type != MSG_FILE_HASH:
+                return False, "Hash não recebido"
+            
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+            filepath = os.path.join(DOWNLOAD_DIR, filename)
+            
+            bytes_received = 0
+            sha256 = hashlib.sha256()
+            
+            with open(filepath, 'wb') as f:
+                while bytes_received < file_size:
+                    msg_type, chunk = self.file_message_queue.get(timeout=10)
+                    if msg_type != MSG_FILE_DATA:
+                        return False, "Dados do arquivo não recebidos corretamente"
+                    
+                    f.write(chunk)
+                    sha256.update(chunk)
+                    bytes_received += len(chunk)
+                    
+                    progress = (bytes_received / file_size) * 100
+                    print(f"\rProgresso: {progress:.1f}%", end='', flush=True)
+            
+            print()
+            
+            file_hash_calculated = sha256.digest()
+            
+            if file_hash_calculated == file_hash_received:
+                return True, f"Arquivo '{filename}' recebido com sucesso. Integridade verificada"
+            else:
+                return False, f"Arquivo '{filename}' recebido, mas a verificação de integridade FALHOU"
+            
+        except queue.Empty:
+            return False, "Timeout: servidor não respondeu a tempo"
+        except Exception as e:
+            return False, f"Erro ao receber arquivo: {e}"
     
     def receive_messages_thread(self):
         while self.running and self.connected:
@@ -80,10 +151,16 @@ class ChatClient:
                     self.connected = False
                     break
                 
-                if msg_type == MSG_CHAT:
+                if self.waiting_for_file and msg_type in [MSG_FILE_OK, MSG_FILE_ERROR, MSG_FILE_META, MSG_FILE_DATA, MSG_FILE_HASH]:
+                    self.file_message_queue.put((msg_type, payload))
+                
+                elif msg_type == MSG_CHAT:
                     message = payload.decode('utf-8')
                     print(f"\n{message}")
                     self.show_prompt()
+                
+                elif msg_type in [MSG_FILE_OK, MSG_FILE_ERROR, MSG_FILE_META, MSG_FILE_DATA, MSG_FILE_HASH]:
+                    pass
                     
             except Exception as e:
                 if self.running:
